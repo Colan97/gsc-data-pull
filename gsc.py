@@ -3,13 +3,14 @@ import pandas as pd
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 import tempfile
 import os
 import json
 from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
-from functools import lru_cache
+import time
 
 # Page config
 st.set_page_config(
@@ -21,20 +22,46 @@ st.set_page_config(
 # Constants
 SCOPES = ['https://www.googleapis.com/auth/webmasters.readonly']
 REDIRECT_URI = "https://gsc-data-extraction.streamlit.app/"
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
 
-# Cache the credentials
-@lru_cache(maxsize=1)
+def get_client_config():
+    """Get client configuration from Streamlit secrets"""
+    try:
+        if 'web' in st.secrets:
+            return st.secrets['web']
+        else:
+            st.error("Client secrets not found in Streamlit secrets. Please add them in the Streamlit Cloud dashboard.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Error accessing secrets: {str(e)}")
+        st.stop()
+
 def get_credentials():
+    """Get credentials from session state"""
     if 'credentials' not in st.session_state:
         return None
-    return Credentials(**st.session_state.credentials)
+    try:
+        return Credentials(**st.session_state.credentials)
+    except Exception as e:
+        st.error(f"Error loading credentials: {str(e)}")
+        return None
 
-# Cache the service
-@lru_cache(maxsize=1)
-def get_service(credentials):
-    return build('searchconsole', 'v1', credentials=credentials)
+def validate_date_range(start_date, end_date):
+    """Validate the date range"""
+    if end_date < start_date:
+        st.error("End date cannot be earlier than start date")
+        return False
+    
+    max_range = timedelta(days=16*30)  # 16 months
+    if end_date - start_date > max_range:
+        st.error("Date range cannot exceed 16 months")
+        return False
+    
+    return True
 
 def get_all_data(service, site_url, request_body):
+    """Get all data with retry logic and progress tracking"""
     all_rows = []
     start_row = 0
     batch_size = 25000  # Maximum allowed by the API
@@ -42,74 +69,81 @@ def get_all_data(service, site_url, request_body):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    try:
-        while True:
-            request_body['startRow'] = start_row
-            request_body['rowLimit'] = batch_size
-            
-            response = service.searchanalytics().query(
-                siteUrl=site_url,
-                body=request_body
-            ).execute()
-            
-            rows = response.get('rows', [])
-            if not rows:
-                break
+    while True:
+        for attempt in range(MAX_RETRIES):
+            try:
+                request_body['startRow'] = start_row
+                request_body['rowLimit'] = batch_size
                 
-            all_rows.extend(rows)
-            start_row += len(rows)
-            
-            # Update progress
-            progress = min(1.0, len(all_rows) / 100000)  # Assuming max 100k rows
-            progress_bar.progress(progress)
-            status_text.text(f"Downloaded {len(all_rows)} rows...")
-            
-            # If we got fewer rows than requested, we've reached the end
-            if len(rows) < batch_size:
-                break
-    except Exception as e:
-        st.error(f"Error fetching data: {str(e)}")
-        return []
-    finally:
-        progress_bar.empty()
-        status_text.empty()
+                response = service.searchanalytics().query(
+                    siteUrl=site_url,
+                    body=request_body
+                ).execute()
+                
+                rows = response.get('rows', [])
+                if not rows:
+                    return all_rows
+                
+                all_rows.extend(rows)
+                start_row += len(rows)
+                
+                # Update progress
+                progress = min(1.0, len(all_rows) / 100000)  # Assuming max 100k rows
+                progress_bar.progress(progress)
+                status_text.text(f"Downloaded {len(all_rows)} rows...")
+                
+                # If we got fewer rows than requested, we've reached the end
+                if len(rows) < batch_size:
+                    return all_rows
+                
+                break  # Success, exit retry loop
+                
+            except HttpError as e:
+                if e.resp.status == 429:  # Rate limit exceeded
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAY * (attempt + 1))  # Exponential backoff
+                        continue
+                st.error(f"API Error: {str(e)}")
+                return all_rows
+            except Exception as e:
+                st.error(f"Error fetching data: {str(e)}")
+                return all_rows
     
+    progress_bar.empty()
+    status_text.empty()
     return all_rows
 
 def create_visualizations(df):
-    # Create visualizations only if we have data
-    if df.empty:
-        return
-    
-    # Top queries by clicks
-    top_queries = df.groupby('query')['clicks'].sum().sort_values(ascending=False).head(10).reset_index()
-    fig_clicks = px.bar(
-        top_queries,
-        x='query',
-        y='clicks',
-        title='Top 10 Queries by Clicks'
-    )
-    st.plotly_chart(fig_clicks, use_container_width=True)
-    
-    # Device distribution
-    device_data = df.groupby('device')['clicks'].sum().reset_index()
-    fig_device = px.pie(
-        device_data,
-        values='clicks',
-        names='device',
-        title='Clicks by Device'
-    )
-    st.plotly_chart(fig_device, use_container_width=True)
-    
-    # Position trend (only for top 20 queries to improve performance)
-    position_data = df.groupby('query')['position'].mean().sort_values().head(20).reset_index()
-    fig_position = px.line(
-        position_data,
-        x='query',
-        y='position',
-        title='Average Position by Query (Top 20)'
-    )
-    st.plotly_chart(fig_position, use_container_width=True)
+    """Create and return visualizations"""
+    try:
+        # Top queries by clicks
+        fig_clicks = px.bar(
+            df.groupby('query')['clicks'].sum().sort_values(ascending=False).head(10).reset_index(),
+            x='query',
+            y='clicks',
+            title='Top 10 Queries by Clicks'
+        )
+        
+        # Device distribution
+        fig_device = px.pie(
+            df.groupby('device')['clicks'].sum().reset_index(),
+            values='clicks',
+            names='device',
+            title='Clicks by Device'
+        )
+        
+        # Position trend
+        fig_position = px.line(
+            df.groupby('query')['position'].mean().sort_values().reset_index(),
+            x='query',
+            y='position',
+            title='Average Position by Query'
+        )
+        
+        return fig_clicks, fig_device, fig_position
+    except Exception as e:
+        st.error(f"Error creating visualizations: {str(e)}")
+        return None, None, None
 
 def main():
     st.title("Google Search Console Data Explorer")
@@ -120,15 +154,12 @@ def main():
         if 'credentials' not in st.session_state:
             if st.button("Sign in with Google"):
                 try:
-                    # Get client secrets from Streamlit secrets
-                    client_config = st.secrets["web"]
-                    
+                    client_config = get_client_config()
                     flow = Flow.from_client_config(
                         client_config,
                         scopes=SCOPES,
                         redirect_uri=REDIRECT_URI
                     )
-                    
                     auth_url, _ = flow.authorization_url(
                         access_type='offline',
                         include_granted_scopes='true'
@@ -154,8 +185,7 @@ def main():
                         except Exception as e:
                             st.error(f"Authentication failed: {str(e)}")
                 except Exception as e:
-                    st.error("Failed to load client configuration. Please check your Streamlit secrets.")
-                    st.error(str(e))
+                    st.error(f"Failed to initialize authentication: {str(e)}")
         else:
             st.success("✅ Authenticated")
             if st.button("Sign Out"):
@@ -165,10 +195,13 @@ def main():
     # Main content
     if 'credentials' in st.session_state:
         credentials = get_credentials()
-        service = get_service(credentials)
-        
-        # Get available sites
+        if not credentials:
+            return
+            
         try:
+            service = build('searchconsole', 'v1', credentials=credentials)
+            
+            # Get available sites
             sites = service.sites().list().execute()
             site_entries = sites.get('siteEntry', [])
             
@@ -202,6 +235,9 @@ def main():
                     "End Date",
                     value=datetime.now()
                 )
+            
+            if not validate_date_range(start_date, end_date):
+                return
             
             if st.button("Fetch Data"):
                 with st.spinner("Fetching data..."):
@@ -256,10 +292,19 @@ def main():
                     
                     # Visualizations
                     st.subheader("Data Visualizations")
-                    create_visualizations(df)
+                    fig_clicks, fig_device, fig_position = create_visualizations(df)
                     
+                    if fig_clicks:
+                        st.plotly_chart(fig_clicks, use_container_width=True)
+                    if fig_device:
+                        st.plotly_chart(fig_device, use_container_width=True)
+                    if fig_position:
+                        st.plotly_chart(fig_position, use_container_width=True)
+                        
+        except HttpError as e:
+            st.error(f"API Error: {str(e)}")
         except Exception as e:
-            st.error(f"Error accessing Google Search Console: {str(e)}")
+            st.error(f"An error occurred: {str(e)}")
 
 if __name__ == "__main__":
     main() 
