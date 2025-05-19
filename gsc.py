@@ -19,6 +19,7 @@ st.set_page_config(
 # Constants
 SCOPES = ['https://www.googleapis.com/auth/webmasters.readonly']
 CLIENT_SECRETS_FILE = "client_secrets.json"
+REDIRECT_URI = "https://need-gsc-data.streamlit.app/"
 
 def get_credentials():
     if 'credentials' not in st.session_state:
@@ -77,7 +78,7 @@ def main():
                 flow = Flow.from_client_secrets_file(
                     CLIENT_SECRETS_FILE,
                     scopes=SCOPES,
-                    redirect_uri="urn:ietf:wg:oauth:2.0:oob"
+                    redirect_uri=REDIRECT_URI
                 )
                 auth_url, _ = flow.authorization_url(
                     access_type='offline',
