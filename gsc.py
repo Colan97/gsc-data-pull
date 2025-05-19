@@ -19,15 +19,8 @@ st.set_page_config(
 
 # Constants
 SCOPES = ['https://www.googleapis.com/auth/webmasters.readonly']
+CLIENT_SECRETS_FILE = "client_secrets.json"
 REDIRECT_URI = "https://gsc-data-extraction.streamlit.app/"
-
-def get_client_config():
-    """Get client configuration from Streamlit secrets"""
-    if 'web' in st.secrets:
-        return st.secrets['web']
-    else:
-        st.error("Client secrets not found in Streamlit secrets. Please add them in the Streamlit Cloud dashboard.")
-        st.stop()
 
 def get_credentials():
     if 'credentials' not in st.session_state:
@@ -79,39 +72,35 @@ def main():
         st.header("Authentication")
         if 'credentials' not in st.session_state:
             if st.button("Sign in with Google"):
-                try:
-                    client_config = get_client_config()
-                    flow = Flow.from_client_config(
-                        client_config,
-                        scopes=SCOPES,
-                        redirect_uri=REDIRECT_URI
-                    )
-                    auth_url, _ = flow.authorization_url(
-                        access_type='offline',
-                        include_granted_scopes='true'
-                    )
-                    st.markdown(f"[Click here to authorize]({auth_url})")
-                    
-                    # Get the authorization code from URL parameters
-                    query_params = st.experimental_get_query_params()
-                    if 'code' in query_params:
-                        auth_code = query_params['code'][0]
-                        try:
-                            flow.fetch_token(code=auth_code)
-                            credentials = flow.credentials
-                            st.session_state.credentials = {
-                                'token': credentials.token,
-                                'refresh_token': credentials.refresh_token,
-                                'token_uri': credentials.token_uri,
-                                'client_id': credentials.client_id,
-                                'client_secret': credentials.client_secret,
-                                'scopes': credentials.scopes
-                            }
-                            st.experimental_rerun()
-                        except Exception as e:
-                            st.error(f"Authentication failed: {str(e)}")
-                except Exception as e:
-                    st.error(f"Failed to initialize authentication: {str(e)}")
+                flow = Flow.from_client_secrets_file(
+                    CLIENT_SECRETS_FILE,
+                    scopes=SCOPES,
+                    redirect_uri=REDIRECT_URI
+                )
+                auth_url, _ = flow.authorization_url(
+                    access_type='offline',
+                    include_granted_scopes='true'
+                )
+                st.markdown(f"[Click here to authorize]({auth_url})")
+                
+                # Get the authorization code from URL parameters
+                query_params = st.experimental_get_query_params()
+                if 'code' in query_params:
+                    auth_code = query_params['code'][0]
+                    try:
+                        flow.fetch_token(code=auth_code)
+                        credentials = flow.credentials
+                        st.session_state.credentials = {
+                            'token': credentials.token,
+                            'refresh_token': credentials.refresh_token,
+                            'token_uri': credentials.token_uri,
+                            'client_id': credentials.client_id,
+                            'client_secret': credentials.client_secret,
+                            'scopes': credentials.scopes
+                        }
+                        st.experimental_rerun()
+                    except Exception as e:
+                        st.error(f"Authentication failed: {str(e)}")
         else:
             st.success("✅ Authenticated")
             if st.button("Sign Out"):
