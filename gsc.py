@@ -19,7 +19,6 @@ st.set_page_config(
 
 # Constants
 SCOPES = ['https://www.googleapis.com/auth/webmasters.readonly']
-CLIENT_SECRETS_FILE = "client_secrets.json"
 REDIRECT_URI = "https://gsc-data-extraction.streamlit.app/"
 
 def get_credentials():
@@ -72,11 +71,27 @@ def main():
         st.header("Authentication")
         if 'credentials' not in st.session_state:
             if st.button("Sign in with Google"):
-                flow = Flow.from_client_secrets_file(
-                    CLIENT_SECRETS_FILE,
+                # Get credentials from Streamlit secrets
+                secrets = st.secrets["web"]
+                
+                # Create flow from secrets
+                flow = Flow.from_client_config(
+                    {
+                        "web": {
+                            "client_id": secrets["client_id"],
+                            "project_id": secrets["project_id"],
+                            "auth_uri": secrets["auth_uri"],
+                            "token_uri": secrets["token_uri"],
+                            "auth_provider_x509_cert_url": secrets["auth_provider_x509_cert_url"],
+                            "client_secret": secrets["client_secret"],
+                            "redirect_uris": secrets["redirect_uris"],
+                            "javascript_origins": secrets["javascript_origins"]
+                        }
+                    },
                     scopes=SCOPES,
                     redirect_uri=REDIRECT_URI
                 )
+                
                 auth_url, _ = flow.authorization_url(
                     access_type='offline',
                     include_granted_scopes='true'
