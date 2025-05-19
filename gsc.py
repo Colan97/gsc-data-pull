@@ -9,6 +9,7 @@ import json
 from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
+from functools import lru_cache
 
 # Page config
 st.set_page_config(
@@ -21,10 +22,17 @@ st.set_page_config(
 SCOPES = ['https://www.googleapis.com/auth/webmasters.readonly']
 REDIRECT_URI = "https://gsc-data-extraction.streamlit.app/"
 
+# Cache the credentials
+@lru_cache(maxsize=1)
 def get_credentials():
     if 'credentials' not in st.session_state:
         return None
     return Credentials(**st.session_state.credentials)
+
+# Cache the service
+@lru_cache(maxsize=1)
+def get_service(credentials):
+    return build('searchconsole', 'v1', credentials=credentials)
 
 def get_all_data(service, site_url, request_body):
     all_rows = []
@@ -34,34 +42,74 @@ def get_all_data(service, site_url, request_body):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    while True:
-        request_body['startRow'] = start_row
-        request_body['rowLimit'] = batch_size
-        
-        response = service.searchanalytics().query(
-            siteUrl=site_url,
-            body=request_body
-        ).execute()
-        
-        rows = response.get('rows', [])
-        if not rows:
-            break
+    try:
+        while True:
+            request_body['startRow'] = start_row
+            request_body['rowLimit'] = batch_size
             
-        all_rows.extend(rows)
-        start_row += len(rows)
-        
-        # Update progress
-        progress = min(1.0, len(all_rows) / 100000)  # Assuming max 100k rows
-        progress_bar.progress(progress)
-        status_text.text(f"Downloaded {len(all_rows)} rows...")
-        
-        # If we got fewer rows than requested, we've reached the end
-        if len(rows) < batch_size:
-            break
+            response = service.searchanalytics().query(
+                siteUrl=site_url,
+                body=request_body
+            ).execute()
+            
+            rows = response.get('rows', [])
+            if not rows:
+                break
+                
+            all_rows.extend(rows)
+            start_row += len(rows)
+            
+            # Update progress
+            progress = min(1.0, len(all_rows) / 100000)  # Assuming max 100k rows
+            progress_bar.progress(progress)
+            status_text.text(f"Downloaded {len(all_rows)} rows...")
+            
+            # If we got fewer rows than requested, we've reached the end
+            if len(rows) < batch_size:
+                break
+    except Exception as e:
+        st.error(f"Error fetching data: {str(e)}")
+        return []
+    finally:
+        progress_bar.empty()
+        status_text.empty()
     
-    progress_bar.empty()
-    status_text.empty()
     return all_rows
+
+def create_visualizations(df):
+    # Create visualizations only if we have data
+    if df.empty:
+        return
+    
+    # Top queries by clicks
+    top_queries = df.groupby('query')['clicks'].sum().sort_values(ascending=False).head(10).reset_index()
+    fig_clicks = px.bar(
+        top_queries,
+        x='query',
+        y='clicks',
+        title='Top 10 Queries by Clicks'
+    )
+    st.plotly_chart(fig_clicks, use_container_width=True)
+    
+    # Device distribution
+    device_data = df.groupby('device')['clicks'].sum().reset_index()
+    fig_device = px.pie(
+        device_data,
+        values='clicks',
+        names='device',
+        title='Clicks by Device'
+    )
+    st.plotly_chart(fig_device, use_container_width=True)
+    
+    # Position trend (only for top 20 queries to improve performance)
+    position_data = df.groupby('query')['position'].mean().sort_values().head(20).reset_index()
+    fig_position = px.line(
+        position_data,
+        x='query',
+        y='position',
+        title='Average Position by Query (Top 20)'
+    )
+    st.plotly_chart(fig_position, use_container_width=True)
 
 def main():
     st.title("Google Search Console Data Explorer")
@@ -117,123 +165,101 @@ def main():
     # Main content
     if 'credentials' in st.session_state:
         credentials = get_credentials()
-        service = build('searchconsole', 'v1', credentials=credentials)
+        service = get_service(credentials)
         
         # Get available sites
-        sites = service.sites().list().execute()
-        site_entries = sites.get('siteEntry', [])
-        
-        if not site_entries:
-            st.warning("No sites found in your Google Search Console account.")
-            return
-        
-        # Site selection
-        site_url = st.selectbox(
-            "Select your site:",
-            options=[site['siteUrl'] for site in site_entries]
-        )
-        
-        # Data type selection
-        data_type = st.radio(
-            "Select data type:",
-            options=["Site-level Data", "URL-level Data"],
-            horizontal=True
-        )
-        data_type = "url" if data_type == "URL-level Data" else "site"
-        
-        # Date range selection
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input(
-                "Start Date",
-                value=datetime.now() - timedelta(days=30)
+        try:
+            sites = service.sites().list().execute()
+            site_entries = sites.get('siteEntry', [])
+            
+            if not site_entries:
+                st.warning("No sites found in your Google Search Console account.")
+                return
+            
+            # Site selection
+            site_url = st.selectbox(
+                "Select your site:",
+                options=[site['siteUrl'] for site in site_entries]
             )
-        with col2:
-            end_date = st.date_input(
-                "End Date",
-                value=datetime.now()
+            
+            # Data type selection
+            data_type = st.radio(
+                "Select data type:",
+                options=["Site-level Data", "URL-level Data"],
+                horizontal=True
             )
-        
-        if st.button("Fetch Data"):
-            with st.spinner("Fetching data..."):
-                request_body = {
-                    'startDate': start_date.strftime('%Y-%m-%d'),
-                    'endDate': end_date.strftime('%Y-%m-%d'),
-                    'dimensions': ['query', 'page', 'device', 'country'] if data_type == 'url' else ['query', 'device', 'country'],
-                }
-                
-                all_rows = get_all_data(service, site_url, request_body)
-                
-                if not all_rows:
-                    st.warning("No data found for the selected parameters.")
-                    return
-                
-                # Convert to DataFrame
-                data = []
-                for row in all_rows:
-                    row_data = {
-                        'clicks': row['clicks'],
-                        'impressions': row['impressions'],
-                        'ctr': row['ctr'],
-                        'position': row['position'],
-                        'query': row['keys'][0],
-                        'device': row['keys'][1],
-                        'country': row['keys'][2]
+            data_type = "url" if data_type == "URL-level Data" else "site"
+            
+            # Date range selection
+            col1, col2 = st.columns(2)
+            with col1:
+                start_date = st.date_input(
+                    "Start Date",
+                    value=datetime.now() - timedelta(days=30)
+                )
+            with col2:
+                end_date = st.date_input(
+                    "End Date",
+                    value=datetime.now()
+                )
+            
+            if st.button("Fetch Data"):
+                with st.spinner("Fetching data..."):
+                    request_body = {
+                        'startDate': start_date.strftime('%Y-%m-%d'),
+                        'endDate': end_date.strftime('%Y-%m-%d'),
+                        'dimensions': ['query', 'page', 'device', 'country'] if data_type == 'url' else ['query', 'device', 'country'],
                     }
-                    if data_type == 'url':
-                        row_data['page'] = row['keys'][3]
-                    data.append(row_data)
-                
-                df = pd.DataFrame(data)
-                
-                # Store in session state
-                st.session_state.df = df
-                
-                # Display summary
-                st.success(f"✅ Downloaded {len(df)} rows of data")
-                
-                # Show data preview
-                st.subheader("Data Preview")
-                st.dataframe(df.head())
-                
-                # Download button
-                csv = df.to_csv(index=False)
-                st.download_button(
-                    label="Download CSV",
-                    data=csv,
-                    file_name=f"gsc_data_{data_type}_{start_date}_{end_date}.csv",
-                    mime="text/csv"
-                )
-                
-                # Visualizations
-                st.subheader("Data Visualizations")
-                
-                # Top queries by clicks
-                fig_clicks = px.bar(
-                    df.groupby('query')['clicks'].sum().sort_values(ascending=False).head(10).reset_index(),
-                    x='query',
-                    y='clicks',
-                    title='Top 10 Queries by Clicks'
-                )
-                st.plotly_chart(fig_clicks, use_container_width=True)
-                
-                # Device distribution
-                fig_device = px.pie(
-                    df.groupby('device')['clicks'].sum().reset_index(),
-                    values='clicks',
-                    names='device',
-                    title='Clicks by Device'
-                )
-                st.plotly_chart(fig_device, use_container_width=True)
-                
-                # Position trend
-                fig_position = px.line(
-                    df.groupby('query')['position'].mean().sort_values().reset_index(),
-                    x='query',
-                    y='position',
-                    title='Average Position by Query'
-                )
-                st.plotly_chart(fig_position, use_container_width=True)
+                    
+                    all_rows = get_all_data(service, site_url, request_body)
+                    
+                    if not all_rows:
+                        st.warning("No data found for the selected parameters.")
+                        return
+                    
+                    # Convert to DataFrame
+                    data = []
+                    for row in all_rows:
+                        row_data = {
+                            'clicks': row['clicks'],
+                            'impressions': row['impressions'],
+                            'ctr': row['ctr'],
+                            'position': row['position'],
+                            'query': row['keys'][0],
+                            'device': row['keys'][1],
+                            'country': row['keys'][2]
+                        }
+                        if data_type == 'url':
+                            row_data['page'] = row['keys'][3]
+                        data.append(row_data)
+                    
+                    df = pd.DataFrame(data)
+                    
+                    # Store in session state
+                    st.session_state.df = df
+                    
+                    # Display summary
+                    st.success(f"✅ Downloaded {len(df)} rows of data")
+                    
+                    # Show data preview
+                    st.subheader("Data Preview")
+                    st.dataframe(df.head())
+                    
+                    # Download button
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        label="Download CSV",
+                        data=csv,
+                        file_name=f"gsc_data_{data_type}_{start_date}_{end_date}.csv",
+                        mime="text/csv"
+                    )
+                    
+                    # Visualizations
+                    st.subheader("Data Visualizations")
+                    create_visualizations(df)
+                    
+        except Exception as e:
+            st.error(f"Error accessing Google Search Console: {str(e)}")
 
 if __name__ == "__main__":
     main() 
