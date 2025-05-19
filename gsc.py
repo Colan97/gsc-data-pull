@@ -1,17 +1,13 @@
 import streamlit as st
 import pandas as pd
-from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-import tempfile
 import os
 import json
 from datetime import datetime, timedelta
 import plotly.express as px
-import plotly.graph_objects as go
-from google.auth.exceptions import RefreshError
-from googleapiclient.errors import HttpError
-import time
+import tempfile
 
 # Page config
 st.set_page_config(
@@ -22,50 +18,14 @@ st.set_page_config(
 
 # Constants
 SCOPES = ['https://www.googleapis.com/auth/webmasters.readonly']
-REDIRECT_URI = "https://gsc-data-extraction.streamlit.app/"
-
-def get_client_secrets():
-    """Get client secrets from Streamlit secrets"""
-    try:
-        # Try to get from Streamlit secrets
-        if 'client_secrets' in st.secrets:
-            return st.secrets['client_secrets']
-        else:
-            st.error("Client secrets not found in Streamlit secrets. Please add them in the Streamlit Cloud dashboard.")
-            st.stop()
-    except Exception as e:
-        st.error(f"Error loading client secrets: {str(e)}")
-        st.stop()
+CLIENT_SECRETS_FILE = "client_secrets.json"
 
 def get_credentials():
-    """Get credentials from session state"""
     if 'credentials' not in st.session_state:
         return None
-    
-    try:
-        credentials = Credentials(**st.session_state.credentials)
-        # Check if token is expired
-        if credentials.expired:
-            credentials.refresh(None)
-            st.session_state.credentials = {
-                'token': credentials.token,
-                'refresh_token': credentials.refresh_token,
-                'token_uri': credentials.token_uri,
-                'client_id': credentials.client_id,
-                'client_secret': credentials.client_secret,
-                'scopes': credentials.scopes
-            }
-        return credentials
-    except RefreshError:
-        st.error("Your session has expired. Please sign in again.")
-        del st.session_state.credentials
-        st.experimental_rerun()
-    except Exception as e:
-        st.error(f"Error with credentials: {str(e)}")
-        return None
+    return Credentials(**st.session_state.credentials)
 
 def get_all_data(service, site_url, request_body):
-    """Fetch all data with pagination and progress tracking"""
     all_rows = []
     start_row = 0
     batch_size = 25000  # Maximum allowed by the API
@@ -73,246 +33,222 @@ def get_all_data(service, site_url, request_body):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    try:
-        while True:
-            request_body['startRow'] = start_row
-            request_body['rowLimit'] = batch_size
+    while True:
+        request_body['startRow'] = start_row
+        request_body['rowLimit'] = batch_size
+        
+        response = service.searchanalytics().query(
+            siteUrl=site_url,
+            body=request_body
+        ).execute()
+        
+        rows = response.get('rows', [])
+        if not rows:
+            break
             
-            try:
-                response = service.searchanalytics().query(
-                    siteUrl=site_url,
-                    body=request_body
-                ).execute()
-                
-                rows = response.get('rows', [])
-                if not rows:
-                    break
-                    
-                all_rows.extend(rows)
-                start_row += len(rows)
-                
-                # Update progress
-                progress = min(1.0, len(all_rows) / 100000)  # Assuming max 100k rows
-                progress_bar.progress(progress)
-                status_text.text(f"Downloaded {len(all_rows)} rows...")
-                
-                # If we got fewer rows than requested, we've reached the end
-                if len(rows) < batch_size:
-                    break
-                    
-            except HttpError as e:
-                if e.resp.status == 429:  # Rate limit exceeded
-                    st.warning("Rate limit exceeded. Waiting before retrying...")
-                    time.sleep(60)  # Wait for 1 minute
-                    continue
-                else:
-                    raise e
-                    
-    except Exception as e:
-        st.error(f"Error fetching data: {str(e)}")
-        return []
-    finally:
-        progress_bar.empty()
-        status_text.empty()
+        all_rows.extend(rows)
+        start_row += len(rows)
+        
+        # Update progress
+        progress = min(1.0, len(all_rows) / 100000)  # Assuming max 100k rows
+        progress_bar.progress(progress)
+        status_text.text(f"Downloaded {len(all_rows)} rows...")
+        
+        # If we got fewer rows than requested, we've reached the end
+        if len(rows) < batch_size:
+            break
     
+    progress_bar.empty()
+    status_text.empty()
     return all_rows
-
-def validate_date_range(start_date, end_date):
-    """Validate the date range"""
-    if end_date < start_date:
-        st.error("End date cannot be before start date")
-        return False
-    
-    date_diff = end_date - start_date
-    if date_diff.days > 16 * 30:  # 16 months
-        st.error("Date range cannot exceed 16 months")
-        return False
-    
-    return True
 
 def main():
     st.title("Google Search Console Data Explorer")
     
+    # Initialize session state
+    if 'credentials' not in st.session_state:
+        st.session_state.credentials = None
+    
     # Sidebar for authentication
     with st.sidebar:
         st.header("Authentication")
-        if 'credentials' not in st.session_state:
+        if st.session_state.credentials is None:
             if st.button("Sign in with Google"):
-                try:
-                    # Get client secrets from Streamlit secrets
-                    client_secrets = get_client_secrets()
-                    
-                    # Create flow from client secrets
-                    flow = Flow.from_client_config(
-                        client_secrets,
-                        scopes=SCOPES,
-                        redirect_uri=REDIRECT_URI
-                    )
-                    
-                    auth_url, _ = flow.authorization_url(
-                        access_type='offline',
-                        include_granted_scopes='true'
-                    )
-                    st.markdown(f"[Click here to authorize]({auth_url})")
-                    
-                    # Get the authorization code from URL parameters
-                    query_params = st.experimental_get_query_params()
-                    if 'code' in query_params:
-                        auth_code = query_params['code'][0]
-                        try:
-                            flow.fetch_token(code=auth_code)
-                            credentials = flow.credentials
-                            st.session_state.credentials = {
-                                'token': credentials.token,
-                                'refresh_token': credentials.refresh_token,
-                                'token_uri': credentials.token_uri,
-                                'client_id': credentials.client_id,
-                                'client_secret': credentials.client_secret,
-                                'scopes': credentials.scopes
-                            }
-                            st.experimental_rerun()
-                        except Exception as e:
-                            st.error(f"Authentication failed: {str(e)}")
-                except Exception as e:
-                    st.error(f"Error during authentication setup: {str(e)}")
+                flow = Flow.from_client_secrets_file(
+                    CLIENT_SECRETS_FILE,
+                    scopes=SCOPES,
+                    redirect_uri="urn:ietf:wg:oauth:2.0:oob"
+                )
+                auth_url, _ = flow.authorization_url(
+                    access_type='offline',
+                    include_granted_scopes='true'
+                )
+                st.markdown(f"[Click here to authorize]({auth_url})")
+                
+                auth_code = st.text_input("Enter the authorization code:")
+                if auth_code:
+                    flow.fetch_token(code=auth_code)
+                    credentials = flow.credentials
+                    st.session_state.credentials = {
+                        'token': credentials.token,
+                        'refresh_token': credentials.refresh_token,
+                        'token_uri': credentials.token_uri,
+                        'client_id': credentials.client_id,
+                        'client_secret': credentials.client_secret,
+                        'scopes': credentials.scopes
+                    }
+                    st.experimental_rerun()
         else:
             st.success("✅ Authenticated")
             if st.button("Sign Out"):
-                del st.session_state.credentials
+                st.session_state.credentials = None
                 st.experimental_rerun()
-
+    
     # Main content
-    if 'credentials' in st.session_state:
+    if st.session_state.credentials:
         credentials = get_credentials()
-        if not credentials:
+        service = build('searchconsole', 'v1', credentials=credentials)
+        
+        # Get available sites
+        sites = service.sites().list().execute()
+        site_entries = sites.get('siteEntry', [])
+        
+        if not site_entries:
+            st.warning("No sites found in your Google Search Console account.")
             return
-            
-        try:
-            service = build('searchconsole', 'v1', credentials=credentials)
-            
-            # Get available sites
-            sites = service.sites().list().execute()
-            site_entries = sites.get('siteEntry', [])
-            
-            if not site_entries:
-                st.warning("No sites found in your Google Search Console account.")
-                return
-            
-            # Site selection
-            site_url = st.selectbox(
-                "Select your site:",
-                options=[site['siteUrl'] for site in site_entries]
+        
+        # Site selection
+        site_url = st.selectbox(
+            "Select your site:",
+            options=[site['siteUrl'] for site in site_entries]
+        )
+        
+        # Data type selection
+        data_type = st.radio(
+            "Select data type:",
+            options=["Site-level Data", "URL-level Data"],
+            horizontal=True
+        )
+        
+        # Date range selection
+        col1, col2 = st.columns(2)
+        with col1:
+            start_date = st.date_input(
+                "Start Date",
+                value=datetime.now() - timedelta(days=30)
             )
-            
-            # Data type selection
-            data_type = st.radio(
-                "Select data type:",
-                options=["Site-level Data", "URL-level Data"],
-                horizontal=True
+        with col2:
+            end_date = st.date_input(
+                "End Date",
+                value=datetime.now()
             )
-            data_type = "url" if data_type == "URL-level Data" else "site"
-            
-            # Date range selection
-            col1, col2 = st.columns(2)
-            with col1:
-                start_date = st.date_input(
-                    "Start Date",
-                    value=datetime.now() - timedelta(days=30)
-                )
-            with col2:
-                end_date = st.date_input(
-                    "End Date",
-                    value=datetime.now()
-                )
-            
-            if not validate_date_range(start_date, end_date):
-                return
-            
-            if st.button("Fetch Data"):
-                with st.spinner("Fetching data..."):
-                    request_body = {
-                        'startDate': start_date.strftime('%Y-%m-%d'),
-                        'endDate': end_date.strftime('%Y-%m-%d'),
-                        'dimensions': ['query', 'page', 'device', 'country'] if data_type == 'url' else ['query', 'device', 'country'],
+        
+        if st.button("Download Data"):
+            with st.spinner("Downloading data..."):
+                # Prepare the request
+                request_body = {
+                    'startDate': start_date.strftime('%Y-%m-%d'),
+                    'endDate': end_date.strftime('%Y-%m-%d'),
+                    'dimensions': ['query', 'page', 'device', 'country'] if data_type == "URL-level Data" else ['query', 'device', 'country'],
+                }
+                
+                # Get all data
+                all_rows = get_all_data(service, site_url, request_body)
+                
+                if not all_rows:
+                    st.warning("No data found for the selected period.")
+                    return
+                
+                # Convert to DataFrame
+                data = []
+                for row in all_rows:
+                    row_data = {
+                        'clicks': row['clicks'],
+                        'impressions': row['impressions'],
+                        'ctr': row['ctr'],
+                        'position': row['position'],
+                        'query': row['keys'][0],
+                        'device': row['keys'][1],
+                        'country': row['keys'][2]
                     }
+                    if data_type == "URL-level Data":
+                        row_data['page'] = row['keys'][3]
+                    data.append(row_data)
+                
+                df = pd.DataFrame(data)
+                
+                # Display summary
+                st.subheader("Data Summary")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Clicks", f"{df['clicks'].sum():,}")
+                with col2:
+                    st.metric("Total Impressions", f"{df['impressions'].sum():,}")
+                with col3:
+                    st.metric("Average CTR", f"{df['ctr'].mean():.2%}")
+                with col4:
+                    st.metric("Average Position", f"{df['position'].mean():.2f}")
+                
+                # Visualizations
+                st.subheader("Data Visualizations")
+                tab1, tab2, tab3 = st.tabs(["Top Queries", "Device Distribution", "Country Distribution"])
+                
+                with tab1:
+                    top_queries = df.groupby('query').agg({
+                        'clicks': 'sum',
+                        'impressions': 'sum'
+                    }).sort_values('clicks', ascending=False).head(10)
                     
-                    all_rows = get_all_data(service, site_url, request_body)
-                    
-                    if not all_rows:
-                        st.warning("No data found for the selected parameters.")
-                        return
-                    
-                    # Convert to DataFrame
-                    data = []
-                    for row in all_rows:
-                        row_data = {
-                            'clicks': row['clicks'],
-                            'impressions': row['impressions'],
-                            'ctr': row['ctr'],
-                            'position': row['position'],
-                            'query': row['keys'][0],
-                            'device': row['keys'][1],
-                            'country': row['keys'][2]
-                        }
-                        if data_type == 'url':
-                            row_data['page'] = row['keys'][3]
-                        data.append(row_data)
-                    
-                    df = pd.DataFrame(data)
-                    
-                    # Store in session state
-                    st.session_state.df = df
-                    
-                    # Display summary
-                    st.success(f"✅ Downloaded {len(df)} rows of data")
-                    
-                    # Show data preview
-                    st.subheader("Data Preview")
-                    st.dataframe(df.head())
-                    
-                    # Download button
-                    csv = df.to_csv(index=False)
-                    st.download_button(
-                        label="Download CSV",
-                        data=csv,
-                        file_name=f"gsc_data_{data_type}_{start_date}_{end_date}.csv",
-                        mime="text/csv"
+                    fig = px.bar(
+                        top_queries,
+                        y=top_queries.index,
+                        x='clicks',
+                        orientation='h',
+                        title="Top 10 Queries by Clicks"
                     )
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with tab2:
+                    device_dist = df.groupby('device').agg({
+                        'clicks': 'sum',
+                        'impressions': 'sum'
+                    })
                     
-                    # Visualizations
-                    st.subheader("Data Visualizations")
-                    
-                    # Top queries by clicks
-                    fig_clicks = px.bar(
-                        df.groupby('query')['clicks'].sum().sort_values(ascending=False).head(10).reset_index(),
-                        x='query',
-                        y='clicks',
-                        title='Top 10 Queries by Clicks'
-                    )
-                    st.plotly_chart(fig_clicks, use_container_width=True)
-                    
-                    # Device distribution
-                    fig_device = px.pie(
-                        df.groupby('device')['clicks'].sum().reset_index(),
+                    fig = px.pie(
+                        device_dist,
                         values='clicks',
-                        names='device',
-                        title='Clicks by Device'
+                        names=device_dist.index,
+                        title="Clicks by Device"
                     )
-                    st.plotly_chart(fig_device, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with tab3:
+                    country_dist = df.groupby('country').agg({
+                        'clicks': 'sum'
+                    }).sort_values('clicks', ascending=False).head(10)
                     
-                    # Position trend
-                    fig_position = px.line(
-                        df.groupby('query')['position'].mean().sort_values().reset_index(),
-                        x='query',
-                        y='position',
-                        title='Average Position by Query'
+                    fig = px.bar(
+                        country_dist,
+                        x=country_dist.index,
+                        y='clicks',
+                        title="Top 10 Countries by Clicks"
                     )
-                    st.plotly_chart(fig_position, use_container_width=True)
-                    
-        except HttpError as e:
-            st.error(f"Google API Error: {str(e)}")
-        except Exception as e:
-            st.error(f"An unexpected error occurred: {str(e)}")
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Download button
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="Download CSV",
+                    data=csv,
+                    file_name=f"gsc_data_{data_type.replace(' ', '_')}_{start_date}_{end_date}.csv",
+                    mime="text/csv"
+                )
+                
+                # Data preview
+                st.subheader("Data Preview")
+                st.dataframe(df.head(1000))
+    else:
+        st.info("Please sign in with your Google account to access the data.")
 
 if __name__ == "__main__":
     main() 
